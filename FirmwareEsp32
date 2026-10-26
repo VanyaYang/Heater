@@ -13,8 +13,8 @@ const float START_BRAKING_TEMP = 95.0; // Начинаем плавно сниж
 bool emergencyShutdown = false;       
 
 // Ваши данные Wi-Fi
-const char* ssid = "ghbdtn2";
-const char* password = "12qwaszxA";
+const char* ssid = "******";
+const char* password = "*****";
 
 // Переменные для ПИД Камеры
 double SetpointChamber = 45.0;     
