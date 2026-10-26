@@ -1,0 +1,199 @@
+#include <WiFi.h>
+#include <WebServer.h>      
+#include <PID_v1.h>          
+#include "OneWireESP32.h" 
+
+#define NTC_PIN 4           // Датчик 1: Термистор NTC 100k на нагревателе (Аналоговый)
+#define ONE_WIRE_BUS 6      // Датчик 2: DS18B20 в камере принтера (Пин 6, RMT)
+#define SSR_PIN 25          // Сигнал управления для твердотельного реле G7DA
+
+// Жесткие лимиты безопасности
+const float MAX_HEATER_LIMIT = 110.0;  // Максимальный потолок для самого PTC
+const float START_BRAKING_TEMP = 95.0; // Начинаем плавно снижать мощность с 95°C
+bool emergencyShutdown = false;       
+
+// Ваши данные Wi-Fi
+const char* ssid = "ghbdtn2";
+const char* password = "12qwaszxA";
+
+// Переменные для ПИД Камеры
+double SetpointChamber = 45.0;     
+double inputChamber = 25.0; 
+double outputChamber = 0.0;
+double KpC = 40.0, KiC = 0.2, KdC = 60.0; // Новые сглаженные настройки против перелетов
+
+double inputHeater = 25.0;  // Текущая температура нагревателя
+
+int WindowSize = 2000;      // Окно медленного ШИМ — 2 секунды
+unsigned long windowStartTime;
+double FinalOutput = 0.0;   // Финальная вычисленная мощность для реле
+
+PID pidChamber(&inputChamber, &outputChamber, &SetpointChamber, KpC, KiC, KdC, DIRECT);
+WebServer server(80); 
+OneWire32 ds(ONE_WIRE_BUS);
+uint64_t sensorAddr = 0xd8000000bc525c28; 
+
+// --- ФУНКЦИЯ ДЛЯ ВАШЕГО ТЕРМИСТОРА NTC 100K B3950 (Резистор 3.2 кОм) ---
+float readNTC(int pin) {
+  int raw = analogRead(pin);
+  static float filteredRaw = 108.0; 
+  if (raw > 0 && raw < 4095) filteredRaw = filteredRaw * 0.8 + raw * 0.2;
+  else return -273.15;
+  
+  float Vout = filteredRaw * (3.3 / 4095.0);
+  if (Vout >= 3.25) return -273.15;
+  
+  float R_thermistor = 3200.0 * ((3.3 / Vout) - 1.0); 
+  float kelvin = 1.0 / (1.0 / 298.15 + log(R_thermistor / 100000.0) / 3950.0);
+  return kelvin - 273.15;
+}
+
+// --- AJAX ИНТЕРФЕЙС ---
+void handleRoot() {
+  String html = "<html><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>iHeater Control</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; background: #f4f4f9; color: #333; padding: 20px; text-align: center; }";
+  html += ".card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); max-width: 400px; margin: 20px auto; }";
+  html += ".param { font-size: 18px; margin: 12px 0; }";
+  html += ".val { font-weight: bold; color: #007bff; }";
+  html += "input[type='number'] { padding: 8px; width: 80px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; text-align: center; }";
+  html += "input[type='button'] { padding: 8px 15px; font-size: 16px; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; margin-left: 10px; }";
+  html += "</style>";
+  
+  html += "<script>";
+  html += "function updateData() {";
+  html += "  fetch('/api').then(response => response.json()).then(data => {";
+  html += "    if(data.emergency) {";
+  html += "      document.getElementById('normal-ui').style.display = 'none';";
+  html += "    } else {";
+  html += "      document.getElementById('temp_cam').innerText = data.chamber + ' °C';";
+  html += "      document.getElementById('temp_heat').innerText = data.heater + ' °C';";
+  html += "      document.getElementById('current_target').innerText = data.target + ' °C';";
+  html += "      document.getElementById('pwm_power').innerText = data.power + ' %';";
+  html += "    }";
+  html += "  });";
+  html += "}";
+  html += "function sendTarget() {";
+  html += "  let val = document.getElementById('new_temp').value;";
+  html += "  fetch('/set?temp=' + val).then(() => updateData());";
+  html += "}";
+  html += "setInterval(updateData, 2000);"; 
+  html += "</script>";
+  html += "</head><body onload='updateData()'>";
+  
+  html += "<div class='card'>";
+  html += "<h1>iHeater Контроллер</h1>";
+  html += "<div id='normal-ui'>";
+  html += "<div class='param'>Камера (DS18B20): <span class='val' id='temp_cam'>...</span></div>";
+  html += "<div class='param'>Нагреватель (NTC 100k): <span class='val' id='temp_heat'>...</span></div>";
+  html += "<div class='param'>Текущая цель: <span class='val' id='current_target'>...</span></div>";
+  html += "<div class='param'>Мощность ШИМ: <span class='val' id='pwm_power'>...</span></div>";
+  html += "<hr style='border:0; border-top:1px solid #eee; margin:20px 0;'>";
+  html += "<div class='param'>";
+  html += "  Задать Т°C: <input type='number' id='new_temp' value='" + String((int)SetpointChamber) + "' min='20' max='95'>";
+  html += "  <input type='button' value='ОК' onclick='sendTarget()'>";
+  html += "</div>";
+  html += "</div>";
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSet() {
+  if (server.hasArg("temp") && !emergencyShutdown) SetpointChamber = server.arg("temp").toFloat();
+  server.sendHeader("Connection", "close"); 
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  delay(2000); 
+  Serial.begin(115200);
+  
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW);
+  analogSetAttenuation(ADC_11db); 
+
+  windowStartTime = millis();
+  pidChamber.SetOutputLimits(0, WindowSize); 
+  pidChamber.SetMode(AUTOMATIC);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.on("/api", []() {
+    server.sendHeader("Connection", "close"); 
+    String json = "{";
+    json += "\"chamber\":" + String(inputChamber, 1) + ",";
+    json += "\"heater\":" + String(inputHeater, 1) + ",";
+    json += "\"target\":" + String(SetpointChamber, 1) + ",";
+    json += "\"power\":" + String((FinalOutput / WindowSize) * 100.0, 0) + ",";
+    json += "\"emergency\":" + String(emergencyShutdown ? "true" : "false");
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+  server.begin();
+  ds.request(); 
+}
+
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 2000) {
+    lastCheck = millis();
+    
+    static bool first_meas = true;
+    if(first_meas) { first_meas = false; delay(500); }
+
+    float tempChamberRead;
+    uint8_t err = ds.getTemp(sensorAddr, tempChamberRead);
+    if (!err) inputChamber = tempChamberRead;
+    
+    ds.request(); 
+    inputHeater = readNTC(NTC_PIN);
+
+    // Блокировка при физическом повреждении датчиков
+    // if (inputHeater < -20.0 || inputChamber < -20.0 || inputChamber > 98.0) {
+    //   emergencyShutdown = true;
+    //   pidChamber.SetMode(MANUAL);
+    //   FinalOutput = 0;
+    //   digitalWrite(SSR_PIN, LOW);
+    //   Serial.println("⚠️ КРИТИЧЕСКИЙ ОБРЫВ ДАТЧИКОВ!");
+    // }
+  }
+
+  if (!emergencyShutdown) {
+    pidChamber.Compute(); // Считаем запрос ПИД1 камеры
+    
+    // --- МАТЕМАТИЧЕСКИЙ КАСКАД ТОРМОЖЕНИЯ ---
+    double scaleFactor = 1.0; 
+
+    if (inputHeater >= MAX_HEATER_LIMIT) {
+      scaleFactor = 0.0; // Выше 110°C — мощность строго ноль
+    } 
+    else if (inputHeater > START_BRAKING_TEMP) {
+      // Плавное снижение мощности в диапазоне 95°C...110°C
+      scaleFactor = 1.0 - ((inputHeater - START_BRAKING_TEMP) / (MAX_HEATER_LIMIT - START_BRAKING_TEMP));
+    }
+
+    // Принудительно подрезаем мощность ПИДа коэффициентом торможения
+    FinalOutput = outputChamber * scaleFactor;
+
+    // Вывод лога без зависающих ПИД-значений
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 2000) {
+      lastLog = millis();
+      Serial.printf("Камера: %.1f C | PTC: %.1f C | Тормоз: %.0f%% | Итог ШИМ: %.0f %%\n", 
+                    inputChamber, inputHeater, scaleFactor * 100.0, (FinalOutput / WindowSize) * 100.0);
+    }
+
+    // ШИМ реле G7DA
+    unsigned long now = millis();
+    if (now - windowStartTime > WindowSize) windowStartTime += WindowSize;
+    if (FinalOutput > (now - windowStartTime)) digitalWrite(SSR_PIN, HIGH);
+    else digitalWrite(SSR_PIN, LOW);
+  }
+}
